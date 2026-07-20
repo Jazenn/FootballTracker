@@ -1,0 +1,21 @@
+name: Keep Alive
+on:
+  schedule:
+    - cron: '0 3 1 * *'   # elke 1e van de maand, 03:00 UTC
+  workflow_dispatch:        # handig om 'm ook handmatig te kunnen testen
+
+permissions:
+  contents: write
+
+jobs:
+  keep-alive:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          date -u > .keepalive
+          git add .keepalive
+          git diff --staged --quiet || git commit -m "chore: keep-alive"
+          git push
