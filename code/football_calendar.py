@@ -15,6 +15,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
+from bs4 import BeautifulSoup
+from zoneinfo import ZoneInfo
+from google.oauth2 import service_account
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
@@ -28,6 +31,11 @@ from config import (
     CALENDAR_ID, EVENT_COLOR_ID, REMINDERS,
     DISPLAY_NAME_MAPPING,
 )
+
+try:
+    from config import CUSTOM_MATCHES
+except ImportError:
+    CUSTOM_MATCHES = []
 
 # --- Logging -------------------------------------------------------------------
 SCRIPT_DIR = Path(__file__).parent
@@ -67,18 +75,44 @@ TSDB_BASE  = "https://www.thesportsdb.com/api/v1/json/123"
 def get_calendar_service():
     creds = None
     
-    # Priority 1: GOOGLE_TOKEN_JSON environment variable (ideal for CI)
-    env_token = os.environ.get("GOOGLE_TOKEN_JSON")
+    # Priority 1: Service Account or User Token from environment variable (ideal for CI)
+    env_token = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON") or os.environ.get("GOOGLE_TOKEN_JSON")
     if env_token:
-        log.info("Loading Google credentials from GOOGLE_TOKEN_JSON environment variable...")
         try:
-            creds = Credentials.from_authorized_user_info(json.loads(env_token), SCOPES)
+            token_data = json.loads(env_token)
+            if token_data.get("type") == "service_account":
+                log.info("Loading Google Service Account credentials from environment variable...")
+                creds = service_account.Credentials.from_service_account_info(token_data, scopes=SCOPES)
+            else:
+                log.info("Loading Google credentials from GOOGLE_TOKEN_JSON environment variable...")
+                creds = Credentials.from_authorized_user_info(token_data, SCOPES)
         except Exception as e:
-            log.warning(f"Failed to load credentials from GOOGLE_TOKEN_JSON: {e}")
+            log.warning(f"Failed to load credentials from environment variable: {e}")
 
-    # Priority 2: Local token.json file
+    # Priority 2: Local Service Account or token.json file
+    if not creds:
+        sa_path = AUTH_DIR / "service_account.json"
+        if sa_path.exists():
+            try:
+                creds = service_account.Credentials.from_service_account_file(str(sa_path), scopes=SCOPES)
+                log.info(f"Loaded Service Account credentials from {sa_path}")
+            except Exception as e:
+                log.warning(f"Failed to load {sa_path}: {e}")
+
     if not creds and TOKEN_PATH.exists():
-        creds = Credentials.from_authorized_user_file(str(TOKEN_PATH), SCOPES)
+        try:
+            token_data = json.loads(TOKEN_PATH.read_text(encoding="utf-8"))
+            if token_data.get("type") == "service_account":
+                creds = service_account.Credentials.from_service_account_info(token_data, scopes=SCOPES)
+                log.info(f"Loaded Service Account credentials from {TOKEN_PATH}")
+            else:
+                creds = Credentials.from_authorized_user_file(str(TOKEN_PATH), SCOPES)
+        except Exception as e:
+            log.warning(f"Failed to load credentials from {TOKEN_PATH}: {e}")
+
+    # Service Accounts don't need browser flows or user token refresh
+    if isinstance(creds, service_account.Credentials):
+        return build("calendar", "v3", credentials=creds)
 
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
@@ -99,11 +133,11 @@ def get_calendar_service():
                  log.info("Loading Google client secrets from credentials.json file...")
                  flow = InstalledAppFlow.from_client_secrets_file(str(CREDENTIALS_PATH), SCOPES)
             else:
-                log.error(f"\n[ERROR] No Google credentials found. Set GOOGLE_TOKEN_JSON or GOOGLE_CREDENTIALS_JSON, or place credentials.json at {CREDENTIALS_PATH}")
+                log.error(f"\n[ERROR] No Google credentials found. Set GOOGLE_TOKEN_JSON, GOOGLE_SERVICE_ACCOUNT_JSON, or place credentials.json at {CREDENTIALS_PATH}")
                 sys.exit(1)
 
             if os.environ.get("CI"):
-                log.error("[ERROR] Browser authorization is not possible in a CI environment. Please provide a valid GOOGLE_TOKEN_JSON.")
+                log.error("[ERROR] Browser authorization is not possible in a CI environment. Please provide a valid GOOGLE_TOKEN_JSON or GOOGLE_SERVICE_ACCOUNT_JSON.")
                 sys.exit(1)
                 
             log.info("Opening browser for Google Calendar authorization...")
@@ -275,6 +309,210 @@ def collect_tsdb_matches() -> dict:
 
 
 # ------------------------------------------------------------------------------
+#  ONSORANJE SCRAPER & DEDUPLICATION/MERGING ENGINE
+# ------------------------------------------------------------------------------
+
+DUTCH_MONTHS = {
+    "jan": 1, "feb": 2, "mrt": 3, "apr": 4, "mei": 5, "jun": 6,
+    "jul": 7, "aug": 8, "sep": 9, "okt": 10, "nov": 11, "dec": 12
+}
+
+TRANSLATIONS = {
+    "ierland": "ireland",
+    "frankrijk": "france",
+    "polen": "poland",
+    "algerije": "algeria",
+    "oezbekistan": "uzbekistan",
+    "zweden": "sweden",
+    "duitsland": "germany",
+    "slovenië": "slovenia",
+    "slovenie": "slovenia",
+    "bosnië": "bosnia",
+    "bosnie": "bosnia",
+    "noorwegen": "norway",
+    "engeland": "england",
+    "spanje": "spain",
+    "italië": "italy",
+    "italie": "italy",
+    "belgië": "belgium",
+    "belgie": "belgium",
+}
+
+def parse_onsoranje_html(html_content: str, category: str) -> list[dict]:
+    soup = BeautifulSoup(html_content, "html.parser")
+    blocks = soup.find_all(class_="Matchblock")
+    matches = []
+    
+    amsterdam_tz = ZoneInfo("Europe/Amsterdam")
+    
+    for b in blocks:
+        wrapper = b.find(class_="Matchblock-wrapper")
+        if not wrapper: continue
+        
+        href = wrapper.get("href")
+        match_id = href.split("/")[-1] if href else ""
+        if not match_id: continue
+        
+        home_el = b.find(class_="Matchblock-team--home")
+        away_el = b.find(class_="Matchblock-team--away")
+        
+        home = home_el.find(class_="Matchblock-teamname").text.strip() if home_el else ""
+        away = away_el.find(class_="Matchblock-teamname").text.strip() if away_el else ""
+        
+        # Rewrite the Dutch national team name to match standard names for display category mapping
+        if category == "Elftal vrouwen":
+            if home == "Nederland": home = "Netherlands Women"
+            if away == "Nederland": away = "Netherlands Women"
+        elif category == "Elftal mannen":
+            if home == "Nederland": home = "Netherlands"
+            if away == "Nederland": away = "Netherlands"
+        elif category == "Elftal O21":
+            if home in ["Nederland", "Jong Oranje"]: home = "Netherlands U21"
+            if away in ["Nederland", "Jong Oranje"]: away = "Netherlands U21"
+        
+        meta = b.find(class_="Matchblock-metadata")
+        date_el = meta.find(class_="Matchblock-metadata--date") if meta else None
+        time_el = meta.find(class_="Matchblock-metadata--time") if meta else None
+        note_el = meta.find(class_="Matchblock-metadata--note") if meta else None
+        
+        date_str = date_el.text.strip() if date_el else ""
+        time_str = time_el.text.strip() if time_el else ""
+        note_str = note_el.text.strip() if note_el else ""
+        
+        if not date_str: continue
+        
+        try:
+            parts = date_str.lower().split()
+            day = int(parts[0])
+            month_str = parts[1]
+            year = int(parts[2])
+            month = DUTCH_MONTHS[month_str]
+        except Exception as e:
+            log.warning(f"    Failed to parse OnsOranje date string '{date_str}': {e}")
+            continue
+            
+        is_nnb = "n.n.b." in note_str.lower() or not time_str
+        
+        if is_nnb:
+            hour, minute = 12, 0
+        else:
+            try:
+                time_parts = time_str.split(":")
+                hour = int(time_parts[0])
+                minute = int(time_parts[1])
+            except Exception as e:
+                log.warning(f"    Failed to parse OnsOranje time string '{time_str}': {e}")
+                hour, minute = 12, 0
+                is_nnb = True
+                
+        dt_local = datetime(year, month, day, hour, minute, tzinfo=amsterdam_tz)
+        dt_utc = dt_local.astimezone(timezone.utc)
+        
+        matches.append({
+            "id": f"onsoranje_{match_id}",
+            "utcDate": dt_utc.isoformat(),
+            "competition": {"name": b.find(class_="Matchblock-tournament").text.strip() if b.find(class_="Matchblock-tournament") else "OnsOranje"},
+            "homeTeam": {"name": home},
+            "awayTeam": {"name": away},
+            "stage": b.find(class_="Matchblock-tournament").text.strip() if b.find(class_="Matchblock-tournament") else "",
+            "is_nnb": is_nnb
+        })
+        
+    return matches
+
+def scrape_onsoranje_team(team_url: str, category: str) -> list[dict]:
+    log.info(f"  Fetching from OnsOranje: {category}...")
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+    try:
+        r = requests.get(team_url, headers=headers, timeout=15)
+        if r.status_code == 200:
+            matches = parse_onsoranje_html(r.text, category)
+            log.info(f"       -> {len(matches)} match(es) online")
+            return matches
+        else:
+            log.warning(f"    Failed to fetch {team_url} (status {r.status_code})")
+            return []
+    except Exception as e:
+        log.error(f"    Error fetching from OnsOranje: {e}")
+        return []
+
+def get_opponent_key(home: str, away: str) -> str:
+    netherlands_terms = ["netherlands", "nederland", "elftal", "oranje"]
+    opponent = ""
+    home_lower = home.lower()
+    away_lower = away.lower()
+    
+    is_home_nl = any(term in home_lower for term in netherlands_terms)
+    is_away_nl = any(term in away_lower for term in netherlands_terms)
+    
+    if is_home_nl and not is_away_nl:
+        opponent = away_lower
+    elif is_away_nl and not is_home_nl:
+        opponent = home_lower
+    else:
+        opponent = home_lower if "netherlands" not in home_lower else away_lower
+
+    for word in ["women", "vrouwen", "u21", "o21", "jong", "under 21", "fc", "team", "national"]:
+        opponent = opponent.replace(word, "")
+    opponent = opponent.strip().strip("-").strip()
+    
+    for dut, eng in TRANSLATIONS.items():
+        if dut in opponent or eng in opponent:
+            return eng
+            
+    return "".join(c for c in opponent if c.isalnum())
+
+def merge_matches(matches_list: list[dict]) -> dict:
+    merged = {}
+    for m in matches_list:
+        opponent = get_opponent_key(m["homeTeam"]["name"], m["awayTeam"]["name"])
+        category = get_display_category(m)
+        
+        raw_date = m["utcDate"]
+        if raw_date.endswith("Z"): raw_date = raw_date[:-1] + "+00:00"
+        dt = datetime.fromisoformat(raw_date)
+        
+        found_key = None
+        for key, existing in merged.items():
+            if existing["opponent"] == opponent and existing["category"] == category:
+                ext_raw_date = existing["match"]["utcDate"]
+                if ext_raw_date.endswith("Z"): ext_raw_date = ext_raw_date[:-1] + "+00:00"
+                ext_dt = datetime.fromisoformat(ext_raw_date)
+                if abs((dt - ext_dt).total_seconds()) <= 86400:
+                    found_key = key
+                    break
+        
+        if found_key:
+            existing = merged[found_key]
+            source_new = m["id"].split("_")[0]
+            source_old = existing["match"]["id"].split("_")[0]
+            
+            if source_new == "onsoranje":
+                is_nnb = m.get("is_nnb", False)
+                if not is_nnb:
+                    existing["match"] = m
+                else:
+                    old_match = existing["match"]
+                    m["utcDate"] = old_match["utcDate"]
+                    existing["match"] = m
+            elif source_old == "onsoranje":
+                is_nnb = existing["match"].get("is_nnb", False)
+                if is_nnb:
+                    existing["match"]["utcDate"] = m["utcDate"]
+        else:
+            key = f"{dt.date().isoformat()}_{opponent}_{category}"
+            merged[key] = {
+                "opponent": opponent,
+                "category": category,
+                "match": m
+            }
+            
+    return {item["match"]["id"]: item["match"] for item in merged.values()}
+
+
+# ------------------------------------------------------------------------------
 #  GOOGLE CALENDAR
 # ------------------------------------------------------------------------------
 
@@ -383,7 +621,45 @@ def main():
     
     log.info("\nFetching matches from TheSportsDB (National Teams)...")
     tsdb_matches = collect_tsdb_matches()
-    matches.update(tsdb_matches)
+    
+    log.info("\nFetching matches from OnsOranje (National Teams)...")
+    onsoranje_matches = []
+    
+    # URLs for the three national teams
+    onsoranje_teams = [
+        {"url": "https://www.onsoranje.nl/teams/185189/programma", "category": "Elftal mannen"},
+        {"url": "https://www.onsoranje.nl/teams/207834/programma", "category": "Elftal vrouwen"},
+        {"url": "https://www.onsoranje.nl/teams/185185/programma", "category": "Elftal O21"},
+    ]
+    
+    for team in onsoranje_teams:
+        matches_list = scrape_onsoranje_team(team["url"], team["category"])
+        if matches_list:
+            onsoranje_matches.extend(matches_list)
+        else:
+            # Fallback to local onsoranje.html for the women's team
+            if team["category"] == "Elftal vrouwen":
+                local_path = ROOT_DIR / "onsoranje.html"
+                if local_path.exists():
+                    log.info("    Failed to fetch women's team program online, parsing local onsoranje.html...")
+                    try:
+                        local_matches = parse_onsoranje_html(local_path.read_text(encoding="utf-8"), "Elftal vrouwen")
+                        log.info(f"      -> {len(local_matches)} match(es) loaded from local fallback")
+                        onsoranje_matches.extend(local_matches)
+                    except Exception as e:
+                        log.error(f"    Failed to parse local onsoranje.html: {e}")
+
+    # Combine all matches and apply custom overrides
+    all_raw_matches = list(matches.values()) + list(tsdb_matches.values()) + onsoranje_matches
+    
+    if CUSTOM_MATCHES:
+        log.info("\nLoading custom override matches...")
+        for m in CUSTOM_MATCHES:
+            log.info(f"  Loaded Custom Match: {m['homeTeam']['name']} vs {m['awayTeam']['name']}")
+            all_raw_matches.append(m)
+            
+    # Deduplicate and merge matches
+    matches = merge_matches(all_raw_matches)
     
     log.info(f"\nTotal unique matches: {len(matches)}")
     if not matches:

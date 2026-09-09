@@ -26,5 +26,6 @@ jobs:
         env:
           API_FOOTBALL_DATA: ${{ secrets.API_FOOTBALL_DATA }}
           GOOGLE_TOKEN_JSON: ${{ secrets.GOOGLE_TOKEN_JSON }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           CI: "true"
         run: python code/football_calendar.py

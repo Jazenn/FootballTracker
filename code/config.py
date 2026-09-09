@@ -60,10 +60,26 @@ DISPLAY_NAME_MAPPING = {
 }
 
 # ─── Google Calendar settings ──────────────────────────────────────────────────
-CALENDAR_ID = "primary"
+CALENDAR_ID = "griffioen.jason@gmail.com"
 EVENT_COLOR_ID = "6"  # Tangerine (orange)
 
 REMINDERS = [
     180,    # 3 hours before
     15,     # 15 minutes before
 ]
+
+# ─── Custom Matches / Manual Overrides ─────────────────────────────────────────
+# You can manually specify matches here that are not in the APIs (e.g. closed-door friendlies).
+# Example format:
+# CUSTOM_MATCHES = [
+#     {
+#         "id":          "custom_uzbekistan_2026",
+#         "utcDate":     "2026-06-08T18:45:00Z",
+#         "competition": {"name": "International Friendlies"},
+#         "homeTeam":    {"name": "Netherlands"},
+#         "awayTeam":    {"name": "Uzbekistan"},
+#         "stage":       "Friendly",
+#     }
+# ]
+CUSTOM_MATCHES = []
+
