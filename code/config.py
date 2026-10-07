@@ -61,7 +61,7 @@ DISPLAY_NAME_MAPPING = {
 
 # ─── Google Calendar settings ──────────────────────────────────────────────────
 CALENDAR_ID = "griffioen.jason@gmail.com"
-EVENT_COLOR_ID = "6"  # Tangerine (orange)
+EVENT_COLOR_ID = "7"  # Tangerine (orange)
 
 REMINDERS = [
     180,    # 3 hours before
